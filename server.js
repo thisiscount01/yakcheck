@@ -1,34 +1,77 @@
 'use strict';
 
 /**
- * YakCheck — 약물 상호작용 검사 서버
- * - GET  /health
- * - GET  /api/drugs/search?q=약이름  (식약처 DUR OpenAPI)
- * - POST /api/interactions/analyze   (AI 마이크로서비스 + 룰 기반 폴백)
- * - static: public/
+ * 약체크 YakCheck — 백엔드 서버 v2.0
+ * Node.js ≥18 / Express 5
+ *
+ * 환경변수:
+ *   DRUG_API_KEY    식약처 공공데이터포털 서비스키 (없으면 DEMO 모드)
+ *   PORT            서버 포트 (기본 3000)
+ *   ML_SERVICE_URL  ML 마이크로서비스 URL (기본 http://localhost:8001/predict)
+ *   ML_TIMEOUT_MS   ML 요청 타임아웃 ms (기본 5000)
+ *
+ * API 엔드포인트:
+ *   GET  /health                     서버·DUR 상태 확인
+ *   GET  /api/drugs/search?q=약이름  식약처 약물 검색 (성분코드 포함)
+ *   POST /api/interactions/analyze   DUR 룰 + ML 상호작용 분석
  */
 
 require('dotenv').config();
-const express   = require('express');
-const axios     = require('axios');
-const path      = require('path');
-const cors      = require('cors');
+const express = require('express');
+const axios   = require('axios');
+const cors    = require('cors');
+const path    = require('path');
+const fs      = require('fs');
 
-const app  = express();
-const PORT = process.env.PORT || 3000;
+// ─────────────────────────────────────────────────────────────────────────────
+// §1. 상수 — 단일 참조 (출처 주석 포함, 수정은 여기서만)
+// ─────────────────────────────────────────────────────────────────────────────
+const PORT            = parseInt(process.env.PORT            ?? '3000',  10);
+const ML_URL          = process.env.ML_SERVICE_URL           ?? 'http://localhost:8001/predict';
+const ML_TIMEOUT_MS   = parseInt(process.env.ML_TIMEOUT_MS  ?? '5000',  10);  // SLA: ML ≤100ms 추론 + 버퍼
+const DRUG_API_KEY    = process.env.DRUG_API_KEY             ?? '';
+const DEMO_MODE       = !DRUG_API_KEY;
 
-// ─── 단일 상수 소스 (SLA, 타임아웃) ──────────────────────────────────────────
-const CFG = {
-  DRUG_API_KEY   : process.env.DRUG_API_KEY || '',
-  DRUG_API_BASE  : 'https://apis.data.go.kr/1471000/DrbEasyDrugInfoService/getDrbEasyDrugList',
-  DUR_API_BASE   : 'https://apis.data.go.kr/1471000/DURIrdntInfoService/getUsjntTabooInfoList',
-  DUR_CAUTION_BASE:'https://apis.data.go.kr/1471000/DURIrdntInfoService/getCopayAtentInfoList',
-  ML_URL         : process.env.ML_SERVICE_URL || 'http://localhost:8001/predict',
-  ML_TIMEOUT_MS  : 2000,   // ML SLA: ≤100ms 추론 + 여유
-  SEARCH_TIMEOUT : 3000,   // 식약처 API 타임아웃
-  MAX_DRUGS      : 10,
-  MIN_QUERY_LEN  : 1,
-};
+const MFDS_BASE         = 'https://apis.data.go.kr/1471000';
+const MFDS_DUR_SEARCH   = `${MFDS_BASE}/DURPrdlstInfoService03/getDURPrdlstInfoList2`;
+const MFDS_DUR_COMBO    = `${MFDS_BASE}/DURPrdlstInfoService03/getUsjntTabooInfoList3`;
+const SEARCH_TIMEOUT_MS = 5000;   // 식약처 API 타임아웃 ms
+const MAX_DRUGS         = 10;     // 최대 약 수 — design-spec §3 기준
+const SEARCH_LIMIT      = 7;      // 드롭다운 최대 항목 — design-spec §2 기준
+const SEARCH_CACHE_TTL  = 300_000; // 검색 캐시 TTL ms (5분)
+const DUR_PAGE_SIZE     = 100;    // 식약처 API 페이지당 건수
+
+// DUR 유형 코드 → 위험도 (AI 엔지니어 확정 스펙 2026-06-13)
+const DUR_TYPE_TO_LEVEL = Object.freeze({
+  '1': 'forbidden', // 병용금기
+  '2': 'danger',    // 용량주의
+  '3': 'danger',    // 임부금기
+  '4': 'caution',   // 노인주의
+  '5': 'caution',   // 연령금기
+});
+
+// DUR 유형 코드 → durBasis (AI 엔지니어 합의)
+const DUR_TYPE_TO_BASIS = Object.freeze({
+  '1': 'COMBO_TABOO',
+  '2': 'DOSE_CAUTION',
+  '3': 'PREG_TABOO',
+  '4': 'ELDERLY_CAUTION',
+  '5': 'AGE_TABOO',
+});
+
+// 위험도 → 한국어 레이블 (explanation 생성용)
+const LEVEL_LABEL = Object.freeze({
+  forbidden: '병용금기',
+  danger:    '위험',
+  caution:   '주의',
+  safe:      '안전',
+});
+
+// 위험도 우선순위 (최고 위험 원칙 — design-spec §4 Screen4)
+const LEVEL_PRIORITY = Object.freeze({ safe: 0, caution: 1, danger: 2, forbidden: 3 });
+
+// ML 불응 폴백 confidence (AI 엔지니어 합의)
+const ML_CONFIDENCE_FALLBACK = 0.0;
 
 // ─── 위험도 상수 ──────────────────────────────────────────────────────────────
 const LEVEL = {
